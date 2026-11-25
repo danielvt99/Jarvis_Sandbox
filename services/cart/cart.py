@@ -20,5 +20,5 @@ class Cart:
         return round(sum(price * quantity for price, quantity in self.items.values()), 2)
 
     def total(self, discount_percent: float = 0) -> float:
-        # Bug left in on purpose: the discount is subtracted as an amount, not a percentage.
-        return round(self.subtotal() - discount_percent, 2)
+        # Fix the bug: apply the discount as a percentage of the subtotal
+        return round(self.subtotal() * (1 - discount_percent / 100), 2)
