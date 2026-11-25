@@ -1,10 +1,15 @@
-# JARVIS emergency fix on a GitHub-hosted runner (decision 032, option L-B: feasibility test).
+# JARVIS emergency fix on a GitHub-hosted runner (decision 032, option L-B).
+# Everything here can be driven from the GitHub phone app, with the laptop off.
 #
-# Start it from the phone, with the laptop off, in either way:
-#   - add the label  jarvis:fix  to an issue (GitHub mobile app: open the issue, Labels), or
-#   - Actions > "JARVIS fix" > Run workflow, and type the issue number.
-# It ends with a DRAFT pull request from a jarvis/* branch. It never pushes to main and
-# never merges; you review and merge in the GitHub app.
+#   1. Add the label  jarvis:fix  to an issue.      JARVIS comments with ONE clarifying question.
+#   2. Reply with a comment on the issue.           JARVIS writes the fix and opens a DRAFT pull request.
+#   3. Review the pull request, mark it ready, merge.   The CI workflow tests and deploys main.
+#   To undo after merging: the pull request's Revert button, then merge the revert.
+#
+#   No question wanted? Use the label  jarvis:fix-now , or Actions > "JARVIS fix" > Run workflow.
+#
+# JARVIS never pushes to main and never merges. Only the repository's owner, members and
+# collaborators can answer its question; comments from anyone else, and from bots, are ignored.
 #
 # One-time repository setting this needs:
 #   Settings > Actions > General > Workflow permissions >
@@ -14,32 +19,77 @@ name: JARVIS fix
 on:
   issues:
     types: [labeled]
+  issue_comment:
+    types: [created]
   workflow_dispatch:
     inputs:
       issue:
-        description: Issue number to fix
+        description: Issue number to fix (no clarifying question is asked)
         required: true
         type: number
 
-# Least privilege for the job's token: read the issue, push one branch, open one pull request.
+# Least privilege for the job's token.
 permissions:
-  contents: write
-  pull-requests: write
-  issues: read
+  contents: write         # push one jarvis/* branch
+  pull-requests: write    # open one draft pull request
+  issues: write           # post the question, manage the jarvis:* labels
+  actions: write          # start the CI workflow on the new branch (see the last step)
 
 concurrency:
   group: jarvis-fix-${{ github.event.issue.number || inputs.issue }}
   cancel-in-progress: false
 
+env:
+  # A number from the event, never free text: safe to use in commands below.
+  ISSUE_NUMBER: ${{ github.event.issue.number || inputs.issue }}
+  JARVIS_MODEL: llama3.2
+
 jobs:
+  ask:
+    if: github.event_name == 'issues' && github.event.label.name == 'jarvis:fix'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Read the issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh issue view "$ISSUE_NUMBER" --json number,title,body > "$RUNNER_TEMP/issue.json"
+      - uses: ./.github/actions/jarvis-model
+        with:
+          model: ${{ env.JARVIS_MODEL }}
+      - name: Think of one clarifying question (no token in this step)
+        env:
+          ISSUE_FILE: ${{ runner.temp }}/issue.json
+          JARVIS_OUT: ${{ runner.temp }}/jarvis-out
+        run: python .github/jarvis/fix_issue.py ask
+      - name: Post the question and wait for the Owner
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh label create "jarvis:waiting" --color FBCA04 --description "JARVIS asked a question and is waiting for an answer" --force
+          gh issue comment "$ISSUE_NUMBER" --body-file "$RUNNER_TEMP/jarvis-out/question.md"
+          gh issue edit "$ISSUE_NUMBER" --add-label "jarvis:waiting"
+
   fix:
-    if: github.event_name == 'workflow_dispatch' || github.event.label.name == 'jarvis:fix'
+    # Three ways in: a manual run, the jarvis:fix-now label, or the Owner's answer to JARVIS's question.
+    # The answer path checks, before any step runs, that the issue is waiting, that the comment is on an
+    # issue (not a pull request), and that its author is trusted and is not a bot.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'issues' && github.event.label.name == 'jarvis:fix-now') ||
+      (github.event_name == 'issue_comment' &&
+       !github.event.issue.pull_request &&
+       contains(github.event.issue.labels.*.name, 'jarvis:waiting') &&
+       contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association) &&
+       github.event.sender.type != 'Bot')
     runs-on: ubuntu-latest
     timeout-minutes: 25
-    env:
-      # A number from the event, never free text: safe to use in commands below.
-      ISSUE_NUMBER: ${{ github.event.issue.number || inputs.issue }}
-      JARVIS_MODEL: llama3.2
     steps:
       - uses: actions/checkout@v4
         with:
@@ -49,32 +99,35 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Read the issue (the only step before the end that holds the token)
+      - name: Read the issue and the Owner's answer (the only step before the end that holds the token)
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh issue view "$ISSUE_NUMBER" --json number,title,body > "$RUNNER_TEMP/issue.json"
-
-      - name: Start the local model engine on this runner
+          COMMENT_ID: ${{ github.event.comment.id }}     # a number; the comment's text is fetched, never pasted into a command
         run: |
-          started=$(date +%s)
-          docker run -d --name ollama -p 127.0.0.1:11434:11434 ollama/ollama:latest
-          for i in $(seq 1 30); do curl -sf http://127.0.0.1:11434/api/version > /dev/null && break; sleep 2; done
-          docker exec ollama ollama pull "$JARVIS_MODEL"
-          echo "| engine start and model download | $(( $(date +%s) - started )) s |" >> "$RUNNER_TEMP/setup_timing"
-          nproc; free -g | head -2
+          gh issue view "$ISSUE_NUMBER" --json number,title,body,comments > "$RUNNER_TEMP/issue.json"
+          if [ -n "$COMMENT_ID" ]; then
+            gh api "repos/${GITHUB_REPOSITORY}/issues/comments/${COMMENT_ID}" --jq .body > "$RUNNER_TEMP/answer.txt"
+            gh issue edit "$ISSUE_NUMBER" --remove-label "jarvis:waiting"    # a second comment must not start a second fix
+          fi
+
+      - uses: ./.github/actions/jarvis-model
+        with:
+          model: ${{ env.JARVIS_MODEL }}
 
       - name: Write the fix and run the tests (no token in this step)
         env:
           ISSUE_FILE: ${{ runner.temp }}/issue.json
+          ANSWER_FILE: ${{ runner.temp }}/answer.txt
           JARVIS_OUT: ${{ runner.temp }}/jarvis-out
         run: |
           python -m pip install --quiet pytest
-          python .github/jarvis/fix_issue.py
+          python .github/jarvis/fix_issue.py fix
 
-      - name: Push the jarvis/* branch and open a draft pull request
+      - name: Push the jarvis/* branch, open a draft pull request, start CI on it
         env:
           GH_TOKEN: ${{ github.token }}
           OUT: ${{ runner.temp }}/jarvis-out
+          BASE: ${{ github.event.repository.default_branch }}
         run: |
           branch="jarvis/${ISSUE_NUMBER}-runner-${GITHUB_RUN_ID}"
           target="$(cat "$OUT/target")"
@@ -85,5 +138,9 @@ jobs:
               commit -m "$(cat "$OUT/title")" -m "Drafted by JARVIS on a GitHub-hosted runner. Refs #${ISSUE_NUMBER}."
           gh auth setup-git
           git push origin "$branch"
-          gh pr create --draft --base "${{ github.event.repository.default_branch }}" --head "$branch" \
-              --title "$(cat "$OUT/title")" --body-file "$OUT/pr_body.md"
+          url="$(gh pr create --draft --base "$BASE" --head "$branch" --title "$(cat "$OUT/title")" --body-file "$OUT/pr_body.md")"
+          # GitHub does not run other workflows for a pull request that a workflow opened (to prevent
+          # loops). A manual start is the documented exception, so CI is started on the branch here.
+          gh workflow run ci.yml --ref "$branch"
+          if [ "$(cat "$OUT/tests_ok")" = "true" ]; then state="tests passing"; else state="TESTS FAILING"; fi
+          gh issue comment "$ISSUE_NUMBER" --body "Draft pull request ready (${state}): ${url}"

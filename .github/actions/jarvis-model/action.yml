@@ -1,0 +1,31 @@
+# Start the local model engine on the runner, with the model kept in the Actions cache so it
+# is downloaded once, not on every run. Shared by the "ask" and "fix" jobs.
+name: Start JARVIS's model
+description: Run Ollama in a container on this runner and make sure the model is present
+inputs:
+  model:
+    description: Model name
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Restore the model from the cache
+      uses: actions/cache@v4
+      with:
+        path: ~/.jarvis-ollama
+        key: jarvis-ollama-${{ inputs.model }}-v1
+
+    - name: Start the engine and fetch the model if it is not cached
+      shell: bash
+      env:
+        MODEL: ${{ inputs.model }}
+      run: |
+        started=$(date +%s)
+        mkdir -p "$HOME/.jarvis-ollama"
+        du -sh "$HOME/.jarvis-ollama" | sed 's/^/model cache before start: /'
+        docker run -d --name ollama -p 127.0.0.1:11434:11434 -v "$HOME/.jarvis-ollama:/root/.ollama" ollama/ollama:latest
+        for i in $(seq 1 30); do curl -sf http://127.0.0.1:11434/api/version > /dev/null && break; sleep 2; done
+        docker exec ollama ollama pull "$MODEL"
+        # The container writes as root; hand the files to the runner's user so the cache step can save them.
+        sudo chown -R "$(id -u):$(id -g)" "$HOME/.jarvis-ollama"
+        echo "| engine start and model (cached after the first run) | $(( $(date +%s) - started )) s |" >> "$RUNNER_TEMP/setup_timing"
